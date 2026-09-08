@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>智能育苗箱 · 远程监控面板</title>
+<script src="lib/mqtt.min.js"></script>
+<script src="lib/echarts.min.js"></script>
+<style>
+  body{font-family:sans-serif;margin:12px;background:#f5f7fa}
+  #online{display:inline-block;width:10px;height:10px;border-radius:50%;background:#999;margin:0 6px 0 12px}
+  #online.on{background:#2ecc71}#online.off{background:#e74c3c}
+  .chart{width:100%;height:300px;background:#fff;border-radius:8px;margin:8px 0}
+  button{font-size:16px;padding:8px 14px;margin:4px;border-radius:6px;border:none;background:#3498db;color:#fff}
+  button.green{background:#27ae60}button.red{background:#e74c3c}button.gray{background:#95a5a6}
+  #alarm{color:#e74c3c;font-weight:bold;min-height:20px}
+  #err{color:#e67e22;font-size:13px;min-height:18px}
+  .val b{font-size:18px}
+  #dateLbl{display:inline-block;min-width:170px;text-align:center;font-weight:bold;font-size:16px}
+</style>
+</head>
+<body>
+<h3>智能育苗箱监控面板<span id="online"></span><span id="ot">离线</span>
+  <span style="font-size:13px;color:#888" id="upd"></span></h3>
+<div style="margin:4px 0">
+  <button class="gray" onclick="nav(-1)">◀ 前一天</button>
+  <span id="dateLbl">--</span>
+  <button class="gray" onclick="nav(1)">后一天 ▶</button>
+  <button onclick="goToday()">回到今天</button>
+  <span id="dayinfo" style="color:#999;font-size:13px;margin-left:8px"></span>
+</div>
+<div class="chart" id="c1"></div>
+<div class="chart" id="c2"></div>
+<div class="val">温度 <b id="t">--</b>℃　湿度 <b id="h">--</b>%　VPD <b id="v">--</b>kPa　光照 <b id="l">--</b>lx　土壤 <b id="s">--</b>%</div>
+<div id="alarm"></div>
+<div id="err"></div><hr>
+<button class="green" onclick="cmd('set_pump_on')">开泵</button>
+<button class="red" onclick="cmd('set_pump_off')">关泵</button>
+<button onclick="cmd('set_light_on')">开补光</button>
+<button onclick="cmd('set_light_off')">关补光</button>
+<button onclick="cmd('set_mist_on')">开雾化</button>
+<button onclick="cmd('set_mist_off')">关雾化</button>
+<button onclick="cmd('set_buzzer_on')">报警响</button>
+<input id="tt" value="26.0" style="width:70px;font-size:16px">
+<button onclick="cmd('set_target_temp',tt.value)">设目标温度</button>
+<input id="tv" value="1.0" style="width:70px;font-size:16px">
+<button onclick="cmd('set_target_vpd',tv.value)">设目标VPD</button>
+<hr><small>横轴=该日 0:00~24:00（每 5 秒一点）；滚轮缩放、按住拖拽平移；鼠标悬停显示横纵坐标数值；
+曲线断开=设备断电时段（间隔&gt;30s 自动断线）；历史数据保存在本浏览器，可翻看最近 5 天。</small>
+<script>
+const HOST='pa9311cd.ala.cn-hangzhou.emqxsl.cn', USER='seedling_box_01', PASS='qqqq961970258', DEV='box1';
+const TEL='seedling/'+DEV+'/telemetry', ST='seedling/'+DEV+'/status', CMD='seedling/'+DEV+'/command';
+const client=mqtt.connect('wss://'+HOST+':8084/mqtt',
+  {username:USER,password:PASS,clientId:'web_'+Math.random().toString(16).slice(2)});
+
+/* ================= 历史存储（浏览器本地，最近 5 天） ================= */
+const GAP_S=30, MAX_DAYS=5;
+let curDate=todayStr();
+const hist={};
+const lastTarget={temp:26.0, vpd:1.0};   /* 当前设定值（虚线用，随遥测回显更新） */
+function pad(n){return ('0'+n).slice(-2);}
+function todayStr(){const d=new Date();return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
+function tsToDate(t){const d=new Date(t*1000);return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
+function addDays(s,n){const a=s.split('-').map(Number);const d=new Date(a[0],a[1]-1,a[2]+n);
+  return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
+function dayLabel(s){const a=s.split('-').map(Number);
+  return a[0]+'年'+a[1]+'月'+a[2]+'日 星期'+'日一二三四五六'[new Date(a[0],a[1]-1,a[2]).getDay()];}
+function dayBounds(s){const a=s.split('-').map(Number);
+  return [new Date(a[0],a[1]-1,a[2],0,0,0).getTime(), new Date(a[0],a[1]-1,a[2]+1,0,0,0).getTime()];}
+function loadDay(s){if(hist[s]==null){try{hist[s]=JSON.parse(localStorage.getItem('hist_'+s)||'[]');}catch(e){hist[s]=[];}}}
+function prune(){Object.keys(localStorage).filter(k=>k.indexOf('hist_')===0)
+  .sort().reverse().slice(MAX_DAYS).forEach(k=>localStorage.removeItem(k));}
+function saveDay(s){try{localStorage.setItem('hist_'+s,JSON.stringify(hist[s]));}
+  catch(e){prune();try{localStorage.setItem('hist_'+s,JSON.stringify(hist[s]));}catch(e2){}}}
+prune();
+
+/* ================= 图表 ================= */
+const fmtHM=v=>{const d=new Date(v);return pad(d.getHours())+':'+pad(d.getMinutes());};
+const fmtHMS=v=>{const d=new Date(v);return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());};
+const c1=echarts.init(document.getElementById('c1'));
+const c2=echarts.init(document.getElementById('c2'));
+echarts.connect([c1,c2]);
+
+function baseOption(title,sub,series,yFloor){
+  const b=dayBounds(curDate);
+  return {
+    title:{text:title,subtext:sub,textStyle:{fontSize:14},subtextStyle:{color:'#999',fontSize:11},left:8,top:4},
+    legend:{top:22},
+    grid:{left:46,right:16,top:56,bottom:42},
+    tooltip:{trigger:'axis',axisPointer:{type:'cross',label:{formatter:p=>fmtHMS(p.value)}},
+      formatter:function(params){
+        let s=fmtHMS(params[0].value[0]);
+        for(let i=0;i<params.length;i++){
+          const p=params[i];
+          if(p.value[1]!=null && p.value[1]!=='-') s+='<br>'+p.marker+' '+p.seriesName+': '+Number(p.value[1]).toFixed(2);
+        }
+        return s;
+      }},
+    xAxis:{type:'time',min:b[0],max:b[1],axisLabel:{formatter:fmtHM},axisLine:{lineStyle:{color:'#bbb'}}},
+    yAxis:yFloor?{scale:true,min:0,max:function(v){return Math.max(v.max,yFloor);}}:{scale:true},
+    dataZoom:[
+      {type:'inside',xAxisIndex:0,filterMode:'none'},
+      {type:'slider',xAxisIndex:0,height:16,bottom:6,brushSelect:false}
+    ],
+    series:series
+  };
+}
+
+function render(resetZoom){
+  loadDay(curDate);
+  const pts=hist[curDate]||[];
+  const dt=[],dh=[],dv=[],dl=[];
+  for(let i=0;i<pts.length;i++){
+    const p=pts[i],tms=p[0]*1000;
+    if(i>0 && p[0]-pts[i-1][0]>GAP_S){          /* 断电断线：空档中点插 null，线在此断开 */
+      const mid=(p[0]+pts[i-1][0])/2*1000;
+      dt.push([mid,null]);dh.push([mid,null]);dv.push([mid,null]);dl.push([mid,null]);
+    }
+    dt.push([tms,p[1]]);dh.push([tms,p[2]]);dv.push([tms,p[3]]);dl.push([tms,p[4]]);
+  }
+  const empty=pts.length===0, sub=empty?'该日暂无数据':'';
+  c1.setOption(baseOption('温湿度 / VPD 曲线（绿色带=0.8~1.2kPa 黄金区间）',sub,[
+    {name:'温度℃',type:'line',showSymbol:false,connectNulls:false,data:dt,
+     markLine:{silent:true,symbol:'none',             /* 目标温度虚线（设定值） */
+       lineStyle:{type:'dashed',color:'#e74c3c',width:1.5},
+       label:{show:true,formatter:'目标 '+lastTarget.temp+'℃',position:'insideEndTop',fontSize:11,color:'#e74c3c'},
+       data:[{yAxis:lastTarget.temp}]}},
+    {name:'湿度%',type:'line',showSymbol:false,connectNulls:false,data:dh},
+    {name:'VPD kPa',type:'line',showSymbol:false,connectNulls:false,data:dv,
+     markArea:{silent:true,itemStyle:{color:'rgba(46,204,113,0.15)'},data:[[{yAxis:0.8},{yAxis:1.2}]]},
+     markLine:{silent:true,symbol:'none',             /* 目标VPD虚线（设定值） */
+       lineStyle:{type:'dashed',color:'#9b59b6',width:1.5},
+       label:{show:true,formatter:'目标VPD '+lastTarget.vpd,position:'insideEndBottom',fontSize:11,color:'#9b59b6'},
+       data:[{yAxis:lastTarget.vpd}]}}]));
+  c2.setOption(baseOption('光照强度 lux（曲线断开=断电时段）',sub,
+    [{name:'光照',type:'line',showSymbol:false,connectNulls:false,data:dl,itemStyle:{color:'#f39c12'}}],1000));
+  if(resetZoom){                                   /* 仅切换日期/回到今天时重置缩放 */
+    c1.dispatchAction({type:'dataZoom',start:0,end:100});
+    c2.dispatchAction({type:'dataZoom',start:0,end:100});
+  }
+  document.getElementById('dateLbl').textContent=dayLabel(curDate);
+  document.getElementById('dayinfo').textContent=empty?'（该日无数据）':'（'+pts.length+' 个点）';
+}
+
+/* ================= 日历翻页 ================= */
+function nav(n){curDate=addDays(curDate,n);render(true);}
+function goToday(){curDate=todayStr();render(true);}
+
+/* ================= 连接与实时数据 ================= */
+function setOnline(on){document.getElementById('online').className=on?'on':'off';
+  document.getElementById('ot').textContent=on?'在线':'离线';}
+client.on('connect',()=>{client.subscribe(TEL);client.subscribe(ST);setOnline(true);
+  document.getElementById('err').textContent='';});
+client.on('close',()=>setOnline(false));
+client.on('error',e=>{document.getElementById('err').textContent=
+  '连接错误: '+(e&&e.message?e.message:e);});
+client.on('message',(t,p)=>{
+  const m=JSON.parse(p);
+  if(t===TEL){
+    /* 防御：ts 必须是 Unix 秒（>1e9）；异常时用本机接收时间兜底 */
+    const ts=(m.ts&&m.ts>1000000000)?m.ts:Math.floor(Date.now()/1000);
+    const day=tsToDate(ts);
+    if(hist[day]==null)hist[day]=[];
+    hist[day].push([ts,m.temp,m.hum,m.vpd,m.lux,m.soil]);
+    saveDay(day);
+    if(m.target_temp)lastTarget.temp=m.target_temp;
+    if(m.target_vpd)lastTarget.vpd=m.target_vpd;
+    document.getElementById('t').textContent=m.temp;
+    document.getElementById('h').textContent=m.hum;
+    document.getElementById('v').textContent=m.vpd;
+    document.getElementById('l').textContent=m.lux;
+    document.getElementById('s').textContent=m.soil;
+    document.getElementById('upd').textContent='更新 '+new Date(ts*1000).toLocaleTimeString();
+    const al=document.getElementById('alarm');
+    al.textContent=(m.vpd>1.2||m.vpd<0.8)?'⚠ VPD 越界: '+m.vpd+' kPa'
+                 :(m.temp>35)?'⚠ 箱温过高: '+m.temp+' ℃':'';
+    if(day===curDate)render(false);      /* 实时刷新，不重置缩放 */
+  }
+});
+function cmd(c,v){client.publish(CMD,JSON.stringify(
+  {seq:1,ts:Math.floor(Date.now()/1000),cmd:c,value:(v===''||v==null||v===undefined)?0:Number(v)}));}
+render(true);
+</script>
+</body>
+</html>
