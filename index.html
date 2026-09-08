@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>智能育苗箱 · 远程监控面板</title>
+<script src="lib/mqtt.min.js"></script>
+<script src="lib/echarts.min.js"></script>
+<style>
+  body{font-family:sans-serif;margin:12px;background:#f5f7fa}
+  #online{display:inline-block;width:10px;height:10px;border-radius:50%;background:#999;margin:0 6px 0 12px}
+  #online.on{background:#2ecc71}#online.off{background:#e74c3c}
+  .chart{width:100%;height:260px;background:#fff;border-radius:8px;margin:8px 0}
+  button{font-size:16px;padding:8px 14px;margin:4px;border-radius:6px;border:none;background:#3498db;color:#fff}
+  button.green{background:#27ae60}button.red{background:#e74c3c}
+  #alarm{color:#e74c3c;font-weight:bold;min-height:20px}
+  .val b{font-size:18px}
+</style>
+</head>
+<body>
+<h3>智能育苗箱监控面板<span id="online"></span><span id="ot">离线</span>
+  <span style="font-size:13px;color:#888" id="upd"></span></h3>
+<div class="chart" id="c1"></div>
+<div class="chart" id="c2"></div>
+<div class="val">温度 <b id="t">--</b>℃　湿度 <b id="h">--</b>%　VPD <b id="v">--</b>kPa　光照 <b id="l">--</b>lx　土壤 <b id="s">--</b>%</div>
+<div id="alarm"></div>
+<div id="err" style="color:#e67e22;font-size:13px;min-height:18px"></div><hr>
+<button class="green" onclick="cmd('set_pump_on')">开泵</button>
+<button class="red" onclick="cmd('set_pump_off')">关泵</button>
+<button onclick="cmd('set_light_on')">开补光</button>
+<button onclick="cmd('set_light_off')">关补光</button>
+<input id="tt" value="26.0" style="width:70px;font-size:16px">
+<button onclick="cmd('set_target_temp',tt.value)">设目标温度</button>
+<input id="tv" value="1.0" style="width:70px;font-size:16px">
+<button onclick="cmd('set_target_vpd',tv.value)">设目标VPD</button>
+<hr><small>主题：seedling/box1/{telemetry,command,status} · 连接：wss 8084</small>
+<script>
+/* ★★★ 只改这两个：你的 EMQX 地址 和 设备密码 ★★★ */
+const HOST='pa9311cd.ala.cn-hangzhou.emqxsl.cn', USER='seedling_box_01', PASS='qqqq961970258', DEV='box1';
+const TEL='seedling/'+DEV+'/telemetry', ST='seedling/'+DEV+'/status', CMD='seedling/'+DEV+'/command';
+const client=mqtt.connect('wss://'+HOST+':8084/mqtt',
+  {username:USER,password:PASS,clientId:'web_'+Math.random().toString(16).slice(2)});
+const dt=[],dh=[],dv=[],dl=[];
+const mk=(id,title,series)=>{const c=echarts.init(document.getElementById(id));
+  c.setOption({title:{text:title,textStyle:{fontSize:14}},legend:{top:20},
+    xAxis:{type:'time'},yAxis:{scale:true},grid:{left:50,right:20,top:50,bottom:30},series});return c;};
+const c1=mk('c1','温湿度 / VPD 实时曲线（绿色带=0.8~1.2kPa 黄金区间）',[
+  {name:'温度℃',type:'line',showSymbol:false,data:dt},
+  {name:'湿度%',type:'line',showSymbol:false,data:dh},
+  {name:'VPD kPa',type:'line',showSymbol:false,data:dv,
+   markArea:{silent:true,itemStyle:{color:'rgba(46,204,113,0.15)'},data:[[{yAxis:0.8},{yAxis:1.2}]]}}]);
+const c2=mk('c2','光照强度 lux',[{name:'光照',type:'line',showSymbol:false,data:dl,itemStyle:{color:'#f39c12'}}]);
+function setOnline(on){document.getElementById('online').className=on?'on':'off';
+  document.getElementById('ot').textContent=on?'在线':'离线';}
+client.on('connect',()=>{client.subscribe(TEL);client.subscribe(ST);setOnline(true);
+  document.getElementById('err').textContent='';});
+client.on('close',()=>setOnline(false));
+client.on('error',e=>{document.getElementById('err').textContent=
+  '连接错误: '+(e&&e.message?e.message:e);});
+client.on('message',(t,p)=>{
+  const m=JSON.parse(p);
+  if(t===TEL){
+    dt.push([new Date(m.ts*1000),m.temp]); dh.push([new Date(m.ts*1000),m.hum]);
+    dv.push([new Date(m.ts*1000),m.vpd]);  dl.push([new Date(m.ts*1000),m.lux]);
+    [dt,dh,dv,dl].forEach(a=>{if(a.length>300)a.shift();});
+    c1.setOption({series:[{data:dt},{data:dh},{data:dv}]});
+    c2.setOption({series:[{data:dl}]});
+    document.getElementById('t').textContent=m.temp;
+    document.getElementById('h').textContent=m.hum;
+    document.getElementById('v').textContent=m.vpd;
+    document.getElementById('l').textContent=m.lux;
+    document.getElementById('s').textContent=m.soil;
+    document.getElementById('upd').textContent='更新 '+new Date(m.ts*1000).toLocaleTimeString();
+    const al=document.getElementById('alarm');
+    al.textContent = (m.vpd>1.2||m.vpd<0.8) ? '⚠ VPD 越界: '+m.vpd+' kPa'
+                  : (m.temp>35)            ? '⚠ 箱温过高: '+m.temp+' ℃' : '';
+  }
+});
+function cmd(c,v){client.publish(CMD,JSON.stringify(
+  {seq:1,ts:Math.floor(Date.now()/1000),cmd:c,value:v||0}));}
+</script>
+</body>
+</html>
